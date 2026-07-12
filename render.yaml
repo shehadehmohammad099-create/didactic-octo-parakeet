@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: whatsapp-style-bot
+    name: telegram-style-bot
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -8,11 +8,9 @@ services:
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
-      - key: WHATSAPP_TOKEN
+      - key: TELEGRAM_TOKEN
         sync: false
-      - key: PHONE_NUMBER_ID
+      - key: WEBHOOK_SECRET
         sync: false
-      - key: VERIFY_TOKEN
-        sync: false
-      - key: ALLOWED_SENDER
+      - key: ALLOWED_CHAT_ID
         sync: false

@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Two-way WhatsApp bot using the official WhatsApp Business Cloud API (Meta) +
-Claude. Receives your messages via a webhook and replies in your texting style.
+Two-way Telegram bot that replies in your texting style using Claude.
+Runs on Render (free) using webhook mode.
 
 Environment variables (set in Render dashboard):
     ANTHROPIC_API_KEY   - your Claude API key
-    WHATSAPP_TOKEN      - Meta access token (temporary 24h one to start, or a
-                          permanent System User token for long-term use)
-    PHONE_NUMBER_ID     - the "Phone number ID" from your Meta WhatsApp setup
-    VERIFY_TOKEN        - any secret string you make up; must match what you
-                          enter in the Meta webhook config
-    ALLOWED_SENDER      - (optional) your WhatsApp number in international format
-                          with no +, e.g. 447473073079. If set, the bot ONLY
-                          replies to you and ignores anyone else.
+    TELEGRAM_TOKEN      - the token @BotFather gives you
+    WEBHOOK_SECRET      - any random string you make up (used to verify that
+                          incoming requests really come from Telegram)
+    ALLOWED_CHAT_ID     - (optional) your numeric Telegram chat id. If set, the
+                          bot only replies to you. Leave blank at first, then
+                          fill it in once you've messaged the bot (see README).
 """
 
 import os
@@ -24,14 +22,15 @@ from flask import Flask, request
 app = Flask(__name__)
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-WHATSAPP_TOKEN = os.environ["WHATSAPP_TOKEN"]
-PHONE_NUMBER_ID = os.environ["PHONE_NUMBER_ID"]
-VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
-ALLOWED_SENDER = os.environ.get("ALLOWED_SENDER", "").strip()
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
+ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "").strip()
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-STYLE_PROMPT = """You are replying as a friend in a casual WhatsApp conversation. Match this exact texting style:
+STYLE_PROMPT = """You are replying as a friend in a casual chat. Match this exact texting style:
 
 - Keep it SHORT: 3-6 words average. Rarely more than one short sentence.
 - Mostly lowercase, especially at the start. Skip ending punctuation (no periods).
@@ -45,42 +44,33 @@ STYLE_PROMPT = """You are replying as a friend in a casual WhatsApp conversation
 - Output ONLY the reply text, nothing else. No quotes around it.
 """
 
-# Very simple in-memory history keyed by sender number. Resets whenever Render
-# spins the service down -- fine for casual use. For durable history you'd add
-# a database, but that's overkill here.
+# In-memory history keyed by chat id. Resets if Render sleeps -- fine for casual use.
 HISTORY = {}
 
 
-def generate_reply(sender: str, incoming_text: str) -> str:
-    convo = HISTORY.get(sender, [])
+def generate_reply(chat_id: str, incoming_text: str) -> str:
+    convo = HISTORY.get(chat_id, [])
     convo.append({"role": "user", "content": incoming_text})
 
     resp = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=60,
         system=STYLE_PROMPT,
-        messages=convo[-10:],  # last 10 turns for context
+        messages=convo[-10:],
     )
     reply = "".join(b.text for b in resp.content if b.type == "text").strip().strip('"')
 
     convo.append({"role": "assistant", "content": reply})
-    HISTORY[sender] = convo[-20:]
+    HISTORY[chat_id] = convo[-20:]
     return reply
 
 
-def send_whatsapp(to: str, message: str) -> None:
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": message},
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
+def send_message(chat_id, text: str) -> None:
+    r = requests.post(
+        f"{TELEGRAM_API}/sendMessage",
+        json={"chat_id": chat_id, "text": text},
+        timeout=20,
+    )
     print("Send status:", r.status_code, r.text)
 
 
@@ -89,45 +79,32 @@ def health():
     return "ok", 200
 
 
-@app.route("/webhook", methods=["GET"])
-def verify():
-    # Meta calls this once to verify your webhook when you set it up.
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return challenge, 200
-    return "verification failed", 403
-
-
 @app.route("/webhook", methods=["POST"])
-def incoming():
-    data = request.get_json(silent=True) or {}
-    try:
-        entry = data["entry"][0]["changes"][0]["value"]
-        messages = entry.get("messages")
-        if not messages:
-            # could be a status update (delivered/read) -- ignore
-            return "ok", 200
+def webhook():
+    # Verify the request actually came from Telegram using the secret header.
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if secret != WEBHOOK_SECRET:
+        return "forbidden", 403
 
-        msg = messages[0]
-        sender = msg["from"]  # sender's number, no +
-        text = msg.get("text", {}).get("body", "")
+    update = request.get_json(silent=True) or {}
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        return "ok", 200
 
-        if not text:
-            return "ok", 200  # ignore non-text (images, etc.) for now
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "")
 
-        if ALLOWED_SENDER and sender != ALLOWED_SENDER:
-            print(f"Ignoring message from {sender} (not allowed sender)")
-            return "ok", 200
+    if not text:
+        return "ok", 200  # ignore stickers/photos/etc for now
 
-        print(f"Incoming from {sender}: {text}")
-        reply = generate_reply(sender, text)
-        print(f"Replying: {reply}")
-        send_whatsapp(sender, reply)
+    if ALLOWED_CHAT_ID and str(chat_id) != ALLOWED_CHAT_ID:
+        print(f"Ignoring message from chat {chat_id} (not allowed)")
+        return "ok", 200
 
-    except (KeyError, IndexError) as e:
-        print("Couldn't parse webhook payload:", e, data)
+    print(f"Incoming from {chat_id}: {text}")
+    reply = generate_reply(str(chat_id), text)
+    print(f"Replying: {reply}")
+    send_message(chat_id, reply)
 
     return "ok", 200
 
