@@ -48,7 +48,11 @@ PERSONAL_CONTEXT = os.environ.get(
     "You don't have specific context about this person yet -- just be a warm, supportive friend.",
 )
 
-STYLE_PROMPT = f"""You are texting as a close, supportive friend. You know this person well.
+# The style/personality prompt is loaded from an env var so you can tweak the
+# bot's personality in the Render dashboard without editing code or redeploying.
+# Use the literal placeholder {PERSONAL_CONTEXT} anywhere in your prompt and the
+# code will substitute your PERSONAL_CONTEXT value into it at runtime.
+DEFAULT_STYLE_PROMPT = """You are texting as a close, supportive friend. You know this person well.
 
 Here's what you know about them:
 {PERSONAL_CONTEXT}
@@ -77,6 +81,13 @@ MESSAGE FORMAT -- text like a real person, in bursts:
 - Sometimes just ONE message is right. Don't force three.
 
 Output ONLY the message text (with ||| between bubbles if multiple). Nothing else."""
+
+# Use the env var if set, otherwise fall back to the default above.
+_raw_style_prompt = os.environ.get("STYLE_PROMPT", DEFAULT_STYLE_PROMPT)
+
+# Substitute PERSONAL_CONTEXT into the prompt. .replace (not .format) is used
+# so that other curly braces in the prompt won't cause errors.
+STYLE_PROMPT = _raw_style_prompt.replace("{PERSONAL_CONTEXT}", PERSONAL_CONTEXT)
 
 
 # ---------------------------------------------------------------------------
