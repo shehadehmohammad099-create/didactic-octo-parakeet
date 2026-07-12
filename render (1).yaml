@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: telegram-style-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: ALLOWED_CHAT_ID
+        sync: false
+      - key: PERSONAL_CONTEXT
+        sync: false
+      - key: DATABASE_URL
+        sync: false
