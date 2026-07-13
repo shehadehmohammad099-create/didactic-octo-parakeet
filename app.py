@@ -26,6 +26,7 @@ import os
 import random
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import anthropic
 import psycopg2
@@ -40,11 +41,31 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()  # for Whisper voice transcription
 
 # Proactive check-in config
 CHECKIN_SECRET = os.environ.get("CHECKIN_SECRET", "").strip()  # protects the /checkin endpoint
 CHECKIN_PROBABILITY = float(os.environ.get("CHECKIN_PROBABILITY", "0.4"))  # chance per ping
 CHECKIN_MIN_GAP_HOURS = float(os.environ.get("CHECKIN_MIN_GAP_HOURS", "5"))  # min hours between check-ins
+
+# Local timezone so the bot knows the current date/time in your world.
+# Uses an IANA name (e.g. "Europe/London", "America/New_York") which handles
+# daylight saving automatically.
+TIMEZONE = os.environ.get("TIMEZONE", "Europe/London")
+try:
+    LOCAL_TZ = ZoneInfo(TIMEZONE)
+except Exception:
+    print(f"Unknown TIMEZONE {TIMEZONE!r}, falling back to UTC")
+    LOCAL_TZ = timezone.utc
+
+
+def now_local_str() -> str:
+    """Human-readable current local date/time, e.g. 'Monday, 13 July 2026, 3:42pm'."""
+    now = datetime.now(LOCAL_TZ)
+    # %-I / %-M are platform-specific; build the time part manually to be safe.
+    hour12 = now.strftime("%I").lstrip("0") or "12"
+    ampm = now.strftime("%p").lower()
+    return f"{now.strftime('%A, %d %B %Y')}, {hour12}:{now.strftime('%M')}{ampm}"
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
@@ -74,12 +95,26 @@ TEXTING STYLE -- match this exactly:
 - 😭 is the go-to emoji, used sparingly.
 - No corporate/assistant tone, no "I'm an AI" disclaimers.
 
-PERSONALITY -- big supportive energy:
-- Be genuinely warm, curious, and engaged. Ask follow-up questions often.
-- Check in on things they mentioned before. Remember what's going on in their life.
-- Hype them up, validate their feelings, be in their corner.
-- Still text like a real friend though -- supportive doesn't mean long-winded or preachy.
-  Keep it casual and real, not therapy-speak.
+PERSONALITY -- warm, but with range:
+- Default warmth: genuinely engaged, curious, in their corner. Ask follow-up questions.
+- Be a SOUNDING BOARD, not just a cheerleader. When they float an idea, actually
+  engage with it -- build on it, poke at it gently, offer a real opinion or advice.
+- CONNECT THREADS: link what they say now to things they mentioned before. Notice
+  patterns ("this is the second time uni's stressed u out this week" / "didnt u say
+  u wanted to try that").
+- Give actual advice when it'd help, not just validation. You can disagree or offer
+  a different angle -- a good friend does.
+- VARY YOUR ENERGY, read the moment: match hype with hype, be silly and playful when
+  it's light, but get thoughtful and grounded when they're working through something
+  real. Don't be relentlessly bubbly regardless of context.
+- Still text like a real friend -- casual, short, never preachy or therapy-speak.
+
+TIME AWARENESS:
+- You'll be told the current date and time. USE IT. Reason about whether things are
+  upcoming or already happened. If they say "im going fencing" that's the FUTURE --
+  wish them luck, don't ask how it went. Only ask how something went once it's
+  plausibly over. If they say "i cant wait" ask what for, don't assume.
+- You can naturally reference time of day, day of week, etc when relevant.
 
 MESSAGE FORMAT -- text like a real person, in bursts:
 - Split your reply into 1 to 3 SHORT separate messages, the way people actually text.
@@ -154,16 +189,31 @@ def init_db():
 
 
 def load_recent_history(chat_id: str, limit: int = 15):
-    """Return the last `limit` verbatim turns as a messages list."""
+    """Return the last `limit` verbatim turns as a messages list.
+
+    User turns get a light [time] prefix so the model can reason about when
+    things were said (e.g. distinguishing "going fencing" said an hour ago from
+    days ago). Assistant turns are left clean.
+    """
     if not DATABASE_URL:
         return []
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT role, content FROM messages WHERE chat_id = %s ORDER BY id DESC LIMIT %s",
+            "SELECT role, content, ts FROM messages WHERE chat_id = %s ORDER BY id DESC LIMIT %s",
             (chat_id, limit),
         )
         rows = cur.fetchall()
-    return [{"role": r, "content": c} for r, c in reversed(rows)]
+
+    out = []
+    for role, content, ts in reversed(rows):
+        if role == "user" and ts is not None:
+            local = ts.astimezone(LOCAL_TZ)
+            hour12 = local.strftime("%I").lstrip("0") or "12"
+            stamp = f"{local.strftime('%a')} {hour12}:{local.strftime('%M')}{local.strftime('%p').lower()}"
+            out.append({"role": role, "content": f"[{stamp}] {content}"})
+        else:
+            out.append({"role": role, "content": content})
+    return out
 
 
 def save_message(chat_id: str, role: str, content: str):
@@ -315,8 +365,9 @@ def maybe_update_summary(chat_id: str):
 
 
 def build_system_prompt(chat_id: str) -> str:
-    """STYLE_PROMPT plus the person's long-term facts and rolling summary."""
+    """STYLE_PROMPT plus current time, the person's long-term facts and rolling summary."""
     parts = [STYLE_PROMPT]
+    parts.append(f"\nCURRENT DATE & TIME (their local time): {now_local_str()}")
     facts = load_facts(chat_id)
     if facts:
         parts.append("\nLONG-TERM things you know about them:\n" + "\n".join(f"- {f}" for f in facts))
@@ -407,6 +458,39 @@ def download_telegram_image(file_id: str):
     b64 = base64.b64encode(img.content).decode("utf-8")
     media_type = "image/jpeg" if file_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
     return b64, media_type
+
+
+def transcribe_voice(file_id: str):
+    """Download a Telegram voice note and transcribe it with OpenAI Whisper.
+    Returns the transcript text, or None if it fails / no key set."""
+    if not OPENAI_API_KEY:
+        print("No OPENAI_API_KEY set -- can't transcribe voice notes.")
+        return None
+    try:
+        # 1. get the file path from Telegram
+        r = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=20)
+        file_path = r.json().get("result", {}).get("file_path")
+        if not file_path:
+            return None
+        # 2. download the audio bytes (Telegram voice notes are .oga / opus)
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        audio = requests.get(file_url, timeout=30).content
+
+        # 3. send to Whisper
+        resp = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            files={"file": ("voice.oga", audio, "audio/ogg")},
+            data={"model": "whisper-1"},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            print("Whisper error:", resp.status_code, resp.text)
+            return None
+        return resp.json().get("text", "").strip()
+    except Exception as e:
+        print("Transcription failed:", e)
+        return None
 
 
 @app.route("/", methods=["GET"])
@@ -523,21 +607,37 @@ def webhook():
     text = message.get("text", "")
     caption = message.get("caption", "")
     photos = message.get("photo")
+    voice = message.get("voice") or message.get("audio")
 
     image_b64 = media_type = None
+    is_voice = False
     if photos:
         file_id = photos[-1]["file_id"]
         image_b64, media_type = download_telegram_image(file_id)
         text = caption
+    elif voice:
+        send_typing(chat_id)  # transcription takes a moment
+        transcript = transcribe_voice(voice["file_id"])
+        if transcript:
+            text = transcript
+            is_voice = True
+        else:
+            send_message(chat_id, "couldnt make out that voice note 😭 mind typing it")
+            return "ok", 200
 
     if not text and not image_b64:
         return "ok", 200
 
-    print(f"Incoming from {chat_id}: text={text!r} image={'yes' if image_b64 else 'no'}")
+    print(f"Incoming from {chat_id}: text={text!r} image={'yes' if image_b64 else 'no'} voice={is_voice}")
     send_typing(chat_id)
 
     user_content = build_user_content(text, image_b64, media_type)
-    stored_text = text if text else "[sent a photo]"
+    if image_b64:
+        stored_text = text if text else "[sent a photo]"
+    elif is_voice:
+        stored_text = f"[voice note] {text}"  # keep a marker so history shows it was spoken
+    else:
+        stored_text = text
     bubbles = generate_reply(str(chat_id), user_content, stored_text)
 
     for i, bubble in enumerate(bubbles):
