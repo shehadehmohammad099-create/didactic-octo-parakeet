@@ -23,7 +23,9 @@ Environment variables (set in Render dashboard):
 
 import base64
 import os
+import random
 import time
+from datetime import datetime, timezone
 
 import anthropic
 import psycopg2
@@ -38,6 +40,11 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+# Proactive check-in config
+CHECKIN_SECRET = os.environ.get("CHECKIN_SECRET", "").strip()  # protects the /checkin endpoint
+CHECKIN_PROBABILITY = float(os.environ.get("CHECKIN_PROBABILITY", "0.4"))  # chance per ping
+CHECKIN_MIN_GAP_HOURS = float(os.environ.get("CHECKIN_MIN_GAP_HOURS", "5"))  # min hours between check-ins
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
@@ -98,7 +105,7 @@ def db_conn():
 
 
 def init_db():
-    """Create the messages table if it doesn't exist. Called once at startup."""
+    """Create tables if they don't exist. Called once at startup."""
     if not DATABASE_URL:
         print("WARNING: no DATABASE_URL set -- running with NO persistent memory.")
         return
@@ -115,12 +122,39 @@ def init_db():
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages (chat_id, id)")
+
+        # Long-term durable facts about the person (one row per fact).
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS facts (
+                id       SERIAL PRIMARY KEY,
+                chat_id  TEXT NOT NULL,
+                fact     TEXT NOT NULL,
+                ts       TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_facts_chat ON facts (chat_id)")
+
+        # Per-chat rolling summary + a marker of how far it has summarized.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_state (
+                chat_id            TEXT PRIMARY KEY,
+                summary            TEXT DEFAULT '',
+                summarized_upto_id INTEGER DEFAULT 0,
+                last_checkin       TIMESTAMPTZ
+            )
+            """
+        )
+        # In case the table already existed without the column (older deploy):
+        cur.execute("ALTER TABLE chat_state ADD COLUMN IF NOT EXISTS last_checkin TIMESTAMPTZ")
         conn.commit()
     print("DB ready.")
 
 
-def load_history(chat_id: str, limit: int = 20):
-    """Return the last `limit` turns for this chat as a messages list."""
+def load_recent_history(chat_id: str, limit: int = 15):
+    """Return the last `limit` verbatim turns as a messages list."""
     if not DATABASE_URL:
         return []
     with db_conn() as conn, conn.cursor() as cur:
@@ -129,7 +163,6 @@ def load_history(chat_id: str, limit: int = 20):
             (chat_id, limit),
         )
         rows = cur.fetchall()
-    # rows are newest-first; reverse to chronological
     return [{"role": r, "content": c} for r, c in reversed(rows)]
 
 
@@ -144,9 +177,155 @@ def save_message(chat_id: str, role: str, content: str):
         conn.commit()
 
 
+# ---- Long-term facts ----
+def load_facts(chat_id: str) -> list:
+    if not DATABASE_URL:
+        return []
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT fact FROM facts WHERE chat_id = %s ORDER BY id", (chat_id,))
+        return [r[0] for r in cur.fetchall()]
+
+
+def add_facts(chat_id: str, new_facts: list):
+    if not DATABASE_URL or not new_facts:
+        return
+    with db_conn() as conn, conn.cursor() as cur:
+        for f in new_facts:
+            cur.execute("INSERT INTO facts (chat_id, fact) VALUES (%s, %s)", (chat_id, f))
+        conn.commit()
+
+
+# ---- Rolling summary ----
+def load_state(chat_id: str):
+    """Return (summary, summarized_upto_id)."""
+    if not DATABASE_URL:
+        return "", 0
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT summary, summarized_upto_id FROM chat_state WHERE chat_id = %s",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+    return (row[0], row[1]) if row else ("", 0)
+
+
+def save_state(chat_id: str, summary: str, upto_id: int):
+    if not DATABASE_URL:
+        return
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO chat_state (chat_id, summary, summarized_upto_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (chat_id) DO UPDATE
+              SET summary = EXCLUDED.summary,
+                  summarized_upto_id = EXCLUDED.summarized_upto_id
+            """,
+            (chat_id, summary, upto_id),
+        )
+        conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Claude + Telegram
 # ---------------------------------------------------------------------------
+RECENT_TURNS = 15          # verbatim turns kept in the live prompt
+SUMMARIZE_AFTER = 25       # once unsummarized older turns exceed this, fold them in
+
+
+def extract_and_store_facts(chat_id: str, user_text: str, bot_reply: str, existing_facts: list):
+    """Lightweight background call: pull any NEW durable facts from this exchange."""
+    try:
+        existing = "\n".join(f"- {f}" for f in existing_facts) or "(none yet)"
+        prompt = (
+            "From the exchange below, extract any NEW durable facts worth "
+            "remembering long-term about the user (their life, relationships, "
+            "job, plans, preferences, ongoing situations). Only NEW facts not "
+            "already known. Ignore fleeting small talk. Return each fact on its "
+            "own line, no bullets. If there are none, return exactly NONE.\n\n"
+            f"Already known:\n{existing}\n\n"
+            f"User: {user_text}\nFriend: {bot_reply}"
+        )
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        out = "".join(b.text for b in resp.content if b.type == "text").strip()
+        if out.upper() != "NONE":
+            new_facts = [line.strip("-• ").strip() for line in out.splitlines() if line.strip()]
+            new_facts = [f for f in new_facts if f and f.upper() != "NONE"]
+            add_facts(chat_id, new_facts)
+    except Exception as e:
+        print("Fact extraction failed (non-fatal):", e)
+
+
+def maybe_update_summary(chat_id: str):
+    """If enough new older messages have piled up, fold them into the rolling summary."""
+    if not DATABASE_URL:
+        return
+    try:
+        summary, upto_id = load_state(chat_id)
+        with db_conn() as conn, conn.cursor() as cur:
+            # grab messages newer than what's summarized, EXCEPT the most recent
+            # RECENT_TURNS (those stay verbatim in the live prompt)
+            cur.execute(
+                "SELECT id FROM messages WHERE chat_id = %s ORDER BY id DESC LIMIT %s",
+                (chat_id, RECENT_TURNS),
+            )
+            recent_ids = [r[0] for r in cur.fetchall()]
+            floor_id = min(recent_ids) if recent_ids else None
+
+            if floor_id is None:
+                return
+            cur.execute(
+                """
+                SELECT id, role, content FROM messages
+                WHERE chat_id = %s AND id > %s AND id < %s
+                ORDER BY id
+                """,
+                (chat_id, upto_id, floor_id),
+            )
+            to_fold = cur.fetchall()
+
+        if len(to_fold) < SUMMARIZE_AFTER:
+            return  # not enough new backlog yet
+
+        transcript = "\n".join(f"{role}: {content}" for _id, role, content in to_fold)
+        prompt = (
+            "Update the running summary of a friendship chat. Keep it a concise "
+            "paragraph capturing the important ongoing threads, events, and mood "
+            "-- not a play-by-play. Merge the new messages into the existing "
+            "summary.\n\n"
+            f"Existing summary:\n{summary or '(empty)'}\n\n"
+            f"New messages to fold in:\n{transcript}\n\n"
+            "Return only the updated summary paragraph."
+        )
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        new_summary = "".join(b.text for b in resp.content if b.type == "text").strip()
+        new_upto = max(_id for _id, _r, _c in to_fold)
+        save_state(chat_id, new_summary, new_upto)
+        print(f"Summary updated for {chat_id}, upto id {new_upto}")
+    except Exception as e:
+        print("Summary update failed (non-fatal):", e)
+
+
+def build_system_prompt(chat_id: str) -> str:
+    """STYLE_PROMPT plus the person's long-term facts and rolling summary."""
+    parts = [STYLE_PROMPT]
+    facts = load_facts(chat_id)
+    if facts:
+        parts.append("\nLONG-TERM things you know about them:\n" + "\n".join(f"- {f}" for f in facts))
+    summary, _ = load_state(chat_id)
+    if summary:
+        parts.append("\nSUMMARY of your earlier conversations:\n" + summary)
+    return "\n".join(parts)
+
+
 def build_user_content(text: str, image_b64: str = None, media_type: str = None):
     if image_b64:
         return [
@@ -159,23 +338,43 @@ def build_user_content(text: str, image_b64: str = None, media_type: str = None)
     return text
 
 
+def count_user_messages(chat_id: str) -> int:
+    if not DATABASE_URL:
+        return 0
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM messages WHERE chat_id = %s AND role = 'user'",
+            (chat_id,),
+        )
+        return cur.fetchone()[0]
+
+
 def generate_reply(chat_id: str, user_content, text_for_storage: str) -> list:
-    # Load prior turns from the DB, then append this new one for the API call.
-    history = load_history(chat_id, limit=20)
+    history = load_recent_history(chat_id, limit=RECENT_TURNS)
     messages = history + [{"role": "user", "content": user_content}]
+    system = build_system_prompt(chat_id)
 
     resp = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=150,
-        system=STYLE_PROMPT,
-        messages=messages[-20:],
+        system=system,
+        messages=messages,
     )
     reply = "".join(b.text for b in resp.content if b.type == "text").strip().strip('"')
 
-    # Persist. For images we store a short text placeholder (can't store the
-    # whole image in history cheaply), so future context still makes sense.
+    # Persist this exchange.
     save_message(chat_id, "user", text_for_storage)
     save_message(chat_id, "assistant", reply)
+
+    # Only run fact extraction every 3rd user message, to cut latency/cost.
+    # Counted from the DB so it's stable across restarts.
+    if count_user_messages(chat_id) % 3 == 0:
+        existing_facts = load_facts(chat_id)
+        extract_and_store_facts(chat_id, text_for_storage, reply, existing_facts)
+
+    # Summary folding only fires when enough backlog has built up anyway,
+    # so it's already infrequent -- leave it running each turn.
+    maybe_update_summary(chat_id)
 
     bubbles = [b.strip() for b in reply.split("|||") if b.strip()]
     return bubbles or [reply]
@@ -213,6 +412,95 @@ def download_telegram_image(file_id: str):
 @app.route("/", methods=["GET"])
 def health():
     return "ok", 200
+
+
+# ---------------------------------------------------------------------------
+# Proactive check-ins
+# ---------------------------------------------------------------------------
+def get_last_checkin(chat_id: str):
+    if not DATABASE_URL:
+        return None
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT last_checkin FROM chat_state WHERE chat_id = %s", (chat_id,))
+        row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
+def set_last_checkin(chat_id: str, when: datetime):
+    if not DATABASE_URL:
+        return
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO chat_state (chat_id, last_checkin) VALUES (%s, %s)
+            ON CONFLICT (chat_id) DO UPDATE SET last_checkin = EXCLUDED.last_checkin
+            """,
+            (chat_id, when),
+        )
+        conn.commit()
+
+
+def generate_checkin(chat_id: str) -> list:
+    """Generate an unprompted check-in message, aware of context + history."""
+    history = load_recent_history(chat_id, limit=RECENT_TURNS)
+    system = build_system_prompt(chat_id)
+    # A synthetic instruction telling the bot to reach out first.
+    nudge = (
+        "Reach out to them first, unprompted, like a friend randomly texting to "
+        "check in. Keep it natural and short. If something's going on in their "
+        "life that you know about, you can reference it. Don't say you're an AI "
+        "or that this is automated. Just text them like a friend would."
+    )
+    messages = history + [{"role": "user", "content": nudge}]
+
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=150,
+        system=system,
+        messages=messages,
+    )
+    reply = "".join(b.text for b in resp.content if b.type == "text").strip().strip('"')
+
+    # Store the check-in as an assistant message so it's part of history.
+    save_message(chat_id, "assistant", reply)
+
+    bubbles = [b.strip() for b in reply.split("|||") if b.strip()]
+    return bubbles or [reply]
+
+
+@app.route("/checkin", methods=["GET", "POST"])
+def checkin():
+    # Protect the endpoint so randoms can't trigger messages to you.
+    token = request.args.get("secret") or request.headers.get("X-Checkin-Secret")
+    if not CHECKIN_SECRET or token != CHECKIN_SECRET:
+        return "forbidden", 403
+
+    if not ALLOWED_CHAT_ID:
+        return "no ALLOWED_CHAT_ID set", 400
+
+    # Roll the dice: only send sometimes, so timing feels random.
+    if random.random() > CHECKIN_PROBABILITY:
+        return "skipped (dice)", 200
+
+    # Enforce a minimum gap since the last check-in.
+    last = get_last_checkin(ALLOWED_CHAT_ID)
+    now = datetime.now(timezone.utc)
+    if last:
+        hours_since = (now - last).total_seconds() / 3600
+        if hours_since < CHECKIN_MIN_GAP_HOURS:
+            return f"skipped (only {hours_since:.1f}h since last)", 200
+
+    print("Sending proactive check-in")
+    send_typing(ALLOWED_CHAT_ID)
+    bubbles = generate_checkin(ALLOWED_CHAT_ID)
+    for i, bubble in enumerate(bubbles):
+        if i > 0:
+            send_typing(ALLOWED_CHAT_ID)
+            time.sleep(min(1.5, 0.4 + len(bubble) * 0.03))
+        send_message(ALLOWED_CHAT_ID, bubble)
+
+    set_last_checkin(ALLOWED_CHAT_ID, now)
+    return "sent", 200
 
 
 @app.route("/webhook", methods=["POST"])
