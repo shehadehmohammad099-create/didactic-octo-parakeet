@@ -69,6 +69,11 @@ def now_local_str() -> str:
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
+# ---- Version info ----
+BOT_VERSION = "1.0 'inner life'"  # bump this when you feel like it
+GIT_COMMIT = os.environ.get("RENDER_GIT_COMMIT", "")[:7]  # auto-set by Render per deploy
+STARTED_AT = datetime.now(timezone.utc)
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 PERSONAL_CONTEXT = os.environ.get(
@@ -184,6 +189,48 @@ def init_db():
         )
         # In case the table already existed without the column (older deploy):
         cur.execute("ALTER TABLE chat_state ADD COLUMN IF NOT EXISTS last_checkin TIMESTAMPTZ")
+        cur.execute("ALTER TABLE chat_state ADD COLUMN IF NOT EXISTS last_reflected_id INTEGER DEFAULT 0")
+
+        # The bot's private reflections between conversations (its "inner life").
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inner_thoughts (
+                id       SERIAL PRIMARY KEY,
+                chat_id  TEXT NOT NULL,
+                thought  TEXT NOT NULL,
+                ts       TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_thoughts_chat ON inner_thoughts (chat_id, id)")
+
+        # The bot's own evolving state (mood, energy, current interest).
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_state (
+                chat_id   TEXT PRIMARY KEY,
+                mood      TEXT DEFAULT 'content',
+                energy    TEXT DEFAULT 'medium',
+                interest  TEXT DEFAULT '',
+                updated   TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+
+        # Episodic memories: discrete meaningful moments/arcs with weight.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS episodes (
+                id           SERIAL PRIMARY KEY,
+                chat_id      TEXT NOT NULL,
+                title        TEXT NOT NULL,
+                memory       TEXT NOT NULL,
+                significance INTEGER DEFAULT 5,   -- 1-10
+                ts           TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_episodes_chat ON episodes (chat_id, significance)")
         conn.commit()
     print("DB ready.")
 
@@ -276,6 +323,194 @@ def save_state(chat_id: str, summary: str, upto_id: int):
         conn.commit()
 
 
+# ---- Inner life (private thoughts) ----
+def load_recent_thoughts(chat_id: str, limit: int = 3) -> list:
+    if not DATABASE_URL:
+        return []
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT thought, ts FROM inner_thoughts WHERE chat_id = %s ORDER BY id DESC LIMIT %s",
+            (chat_id, limit),
+        )
+        rows = cur.fetchall()
+    out = []
+    for thought, ts in reversed(rows):
+        local = ts.astimezone(LOCAL_TZ) if ts else None
+        stamp = local.strftime("%a") if local else ""
+        out.append(f"({stamp}) {thought}" if stamp else thought)
+    return out
+
+
+def add_thought(chat_id: str, thought: str):
+    if not DATABASE_URL or not thought:
+        return
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO inner_thoughts (chat_id, thought) VALUES (%s, %s)", (chat_id, thought))
+        conn.commit()
+
+
+# ---- Bot's own state ----
+def load_bot_state(chat_id: str) -> dict:
+    if not DATABASE_URL:
+        return {"mood": "content", "energy": "medium", "interest": ""}
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT mood, energy, interest FROM bot_state WHERE chat_id = %s", (chat_id,))
+        row = cur.fetchone()
+    if row:
+        return {"mood": row[0], "energy": row[1], "interest": row[2]}
+    return {"mood": "content", "energy": "medium", "interest": ""}
+
+
+def save_bot_state(chat_id: str, mood: str, energy: str, interest: str):
+    if not DATABASE_URL:
+        return
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO bot_state (chat_id, mood, energy, interest, updated)
+            VALUES (%s, %s, %s, %s, now())
+            ON CONFLICT (chat_id) DO UPDATE
+              SET mood = EXCLUDED.mood, energy = EXCLUDED.energy,
+                  interest = EXCLUDED.interest, updated = now()
+            """,
+            (chat_id, mood, energy, interest),
+        )
+        conn.commit()
+
+
+# ---- Episodic memory ----
+def load_top_episodes(chat_id: str, limit: int = 5) -> list:
+    """Most significant episodes, recent ones favored on ties."""
+    if not DATABASE_URL:
+        return []
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT title, memory, ts FROM episodes
+            WHERE chat_id = %s
+            ORDER BY significance DESC, id DESC
+            LIMIT %s
+            """,
+            (chat_id, limit),
+        )
+        rows = cur.fetchall()
+    out = []
+    for title, memory, ts in rows:
+        local = ts.astimezone(LOCAL_TZ) if ts else None
+        when = local.strftime("%d %b") if local else ""
+        out.append(f"[{when}] {title}: {memory}" if when else f"{title}: {memory}")
+    return out
+
+
+def add_episodes(chat_id: str, episodes: list):
+    if not DATABASE_URL or not episodes:
+        return
+    with db_conn() as conn, conn.cursor() as cur:
+        for ep in episodes:
+            cur.execute(
+                "INSERT INTO episodes (chat_id, title, memory, significance) VALUES (%s, %s, %s, %s)",
+                (chat_id, ep.get("title", "moment"), ep.get("memory", ""), int(ep.get("significance", 5))),
+            )
+        conn.commit()
+
+
+# ---- Reflection engine ----
+def get_reflection_marker(chat_id: str) -> int:
+    if not DATABASE_URL:
+        return 0
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT last_reflected_id FROM chat_state WHERE chat_id = %s", (chat_id,))
+        row = cur.fetchone()
+    return row[0] if row and row[0] else 0
+
+
+def set_reflection_marker(chat_id: str, upto_id: int):
+    if not DATABASE_URL:
+        return
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO chat_state (chat_id, last_reflected_id) VALUES (%s, %s)
+            ON CONFLICT (chat_id) DO UPDATE SET last_reflected_id = EXCLUDED.last_reflected_id
+            """,
+            (chat_id, upto_id),
+        )
+        conn.commit()
+
+
+def reflect(chat_id: str):
+    """The bot's between-conversation inner life. Runs on cron pings when there's
+    been new conversation since the last reflection. One Claude call produces:
+    a private thought, an updated mood/state, and any episodes worth keeping."""
+    if not DATABASE_URL:
+        return
+    try:
+        marker = get_reflection_marker(chat_id)
+        with db_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, role, content FROM messages WHERE chat_id = %s AND id > %s ORDER BY id",
+                (chat_id, marker),
+            )
+            new_msgs = cur.fetchall()
+
+        if len(new_msgs) < 4:
+            return  # not enough new conversation to reflect on
+
+        transcript = "\n".join(f"{role}: {content}" for _id, role, content in new_msgs)
+        state = load_bot_state(chat_id)
+        recent_thoughts = load_recent_thoughts(chat_id, limit=3)
+
+        prompt = (
+            "You are the inner voice of someone's close friend, reflecting privately "
+            "after recent conversations with them. Current time: " + now_local_str() + ".\n\n"
+            f"Your current state: mood={state['mood']}, energy={state['energy']}, "
+            f"currently into: {state['interest'] or 'nothing in particular'}\n"
+            f"Your recent private thoughts:\n" + ("\n".join(recent_thoughts) or "(none)") + "\n\n"
+            f"The recent conversation:\n{transcript}\n\n"
+            "Reflect as their friend would. Respond ONLY with JSON, no markdown fences:\n"
+            "{\n"
+            '  "thought": "a short private reflection in casual first person -- what stayed with you, '
+            'what you\'re wondering about them, anything you want to follow up on",\n'
+            '  "mood": "one or two words for your own current mood (let it drift naturally, '
+            'influenced a little by the conversations but also just life)",\n'
+            '  "energy": "low, medium, or high",\n'
+            '  "interest": "a thing you\'re personally into at the moment (a show, an idea, a hobby '
+            '-- invent/evolve this naturally, it\'s YOUR life)",\n'
+            '  "episodes": [ {"title": "...", "memory": "1-2 sentence memory of a meaningful moment '
+            'or arc from these conversations", "significance": 1-10} ]\n'
+            "}\n"
+            "episodes should usually be empty [] -- only add one for genuinely meaningful moments "
+            "(big news, emotional conversations, decisions, memorable jokes), not routine chat."
+        )
+
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        out = "".join(b.text for b in resp.content if b.type == "text").strip()
+        out = out.replace("```json", "").replace("```", "").strip()
+
+        import json as _json
+        data = _json.loads(out)
+
+        if data.get("thought"):
+            add_thought(chat_id, data["thought"])
+        save_bot_state(
+            chat_id,
+            data.get("mood", state["mood"]),
+            data.get("energy", state["energy"]),
+            data.get("interest", state["interest"]),
+        )
+        add_episodes(chat_id, data.get("episodes", []))
+
+        set_reflection_marker(chat_id, max(m[0] for m in new_msgs))
+        print(f"Reflected for {chat_id}: mood={data.get('mood')}, "
+              f"{len(data.get('episodes', []))} episode(s), thought saved.")
+    except Exception as e:
+        print("Reflection failed (non-fatal):", e)
+
+
 # ---------------------------------------------------------------------------
 # Claude + Telegram
 # ---------------------------------------------------------------------------
@@ -365,12 +600,36 @@ def maybe_update_summary(chat_id: str):
 
 
 def build_system_prompt(chat_id: str) -> str:
-    """STYLE_PROMPT plus current time, the person's long-term facts and rolling summary."""
+    """STYLE_PROMPT plus current time, the bot's own state/inner life, and memory layers."""
     parts = [STYLE_PROMPT]
     parts.append(f"\nCURRENT DATE & TIME (their local time): {now_local_str()}")
+
+    # The bot's own life
+    state = load_bot_state(chat_id)
+    parts.append(
+        f"\nYOUR OWN current state (let it subtly color your texting, don't announce it): "
+        f"mood: {state['mood']}, energy: {state['energy']}"
+        + (f", currently into: {state['interest']}" if state['interest'] else "")
+    )
+    thoughts = load_recent_thoughts(chat_id, limit=3)
+    if thoughts:
+        parts.append(
+            "\nYOUR recent private thoughts about them (things that stayed with you between chats "
+            "-- you can naturally follow up on these, like a friend who's been thinking):\n"
+            + "\n".join(f"- {t}" for t in thoughts)
+        )
+
+    # Memory of them
     facts = load_facts(chat_id)
     if facts:
         parts.append("\nLONG-TERM things you know about them:\n" + "\n".join(f"- {f}" for f in facts))
+    episodes = load_top_episodes(chat_id, limit=5)
+    if episodes:
+        parts.append(
+            "\nSHARED MEMORIES (specific moments you both lived through -- reference them "
+            "naturally when relevant, like 'remember when...'):\n"
+            + "\n".join(f"- {e}" for e in episodes)
+        )
     summary, _ = load_state(chat_id)
     if summary:
         parts.append("\nSUMMARY of your earlier conversations:\n" + summary)
@@ -562,9 +821,13 @@ def checkin():
     if not ALLOWED_CHAT_ID:
         return "no ALLOWED_CHAT_ID set", 400
 
+    # Reflect first: the bot's inner life runs on every ping, whether or not
+    # a message gets sent. This is what makes follow-ups feel self-motivated.
+    reflect(ALLOWED_CHAT_ID)
+
     # Roll the dice: only send sometimes, so timing feels random.
     if random.random() > CHECKIN_PROBABILITY:
-        return "skipped (dice)", 200
+        return "reflected, skipped send (dice)", 200
 
     # Enforce a minimum gap since the last check-in.
     last = get_last_checkin(ALLOWED_CHAT_ID)
@@ -605,6 +868,22 @@ def webhook():
         return "ok", 200
 
     text = message.get("text", "")
+
+    # ---- Commands (handled directly, never sent to Claude) ----
+    if text.strip().lower() in ("/version", "/botversion", "/botversionnow", "/v"):
+        state = load_bot_state(str(chat_id))
+        uptime_h = (datetime.now(timezone.utc) - STARTED_AT).total_seconds() / 3600
+        lines = [
+            f"🤖 version {BOT_VERSION}" + (f" ({GIT_COMMIT})" if GIT_COMMIT else ""),
+            f"⏱ this instance up {uptime_h:.1f}h (sleeps when idle, that's normal)",
+            f"🧠 memory: {'ON (postgres)' if DATABASE_URL else 'OFF'}",
+            f"🎙 voice notes: {'ON' if OPENAI_API_KEY else 'OFF (no OPENAI_API_KEY)'}",
+            f"⏰ timezone: {TIMEZONE} — thinks it's {now_local_str()}",
+            f"💭 current mood: {state['mood']}, energy {state['energy']}"
+            + (f", into: {state['interest']}" if state['interest'] else ""),
+        ]
+        send_message(chat_id, "\n".join(lines))
+        return "ok", 200
     caption = message.get("caption", "")
     photos = message.get("photo")
     voice = message.get("voice") or message.get("audio")
