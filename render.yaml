@@ -18,5 +18,17 @@ services:
         sync: false
       - key: PERSONAL_CONTEXT
         sync: false
+      - key: STYLE_PROMPT
+        sync: false
       - key: DATABASE_URL
+        sync: false
+      - key: CHECKIN_SECRET
+        sync: false
+      - key: CHECKIN_PROBABILITY
+        sync: false
+      - key: CHECKIN_MIN_GAP_HOURS
+        sync: false
+      - key: TIMEZONE
+        sync: false
+      - key: OPENAI_API_KEY
         sync: false
