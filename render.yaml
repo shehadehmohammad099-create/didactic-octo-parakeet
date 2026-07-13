@@ -32,3 +32,11 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      - key: REPLY_DELAY_MIN
+        sync: false
+      - key: REPLY_DELAY_MAX
+        sync: false
+      - key: TYPO_PROBABILITY
+        sync: false
+      - key: SILENCE_PROBABILITY
+        sync: false
