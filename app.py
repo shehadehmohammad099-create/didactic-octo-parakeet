@@ -24,6 +24,7 @@ Environment variables (set in Render dashboard):
 import base64
 import os
 import random
+import threading
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -47,6 +48,16 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()  # for Whisper voi
 CHECKIN_SECRET = os.environ.get("CHECKIN_SECRET", "").strip()  # protects the /checkin endpoint
 CHECKIN_PROBABILITY = float(os.environ.get("CHECKIN_PROBABILITY", "0.4"))  # chance per ping
 CHECKIN_MIN_GAP_HOURS = float(os.environ.get("CHECKIN_MIN_GAP_HOURS", "5"))  # min hours between check-ins
+
+# ---- Human-like texting mechanics ----
+REPLY_DELAY_MIN = float(os.environ.get("REPLY_DELAY_MIN", "2"))    # seconds
+REPLY_DELAY_MAX = float(os.environ.get("REPLY_DELAY_MAX", "45"))   # seconds
+TYPO_PROBABILITY = float(os.environ.get("TYPO_PROBABILITY", "0.12"))     # chance a reply includes a typo+fix
+SILENCE_PROBABILITY = float(os.environ.get("SILENCE_PROBABILITY", "0.04"))  # chance it leaves you on delivered
+
+# Dedup Telegram update retries (needed because we ack instantly and reply slowly)
+_SEEN_UPDATES = set()
+_SEEN_LOCK = threading.Lock()
 
 # Local timezone so the bot knows the current date/time in your world.
 # Uses an IANA name (e.g. "Europe/London", "America/New_York") which handles
@@ -112,6 +123,16 @@ PERSONALITY -- warm, but with range:
 - VARY YOUR ENERGY, read the moment: match hype with hype, be silly and playful when
   it's light, but get thoughtful and grounded when they're working through something
   real. Don't be relentlessly bubbly regardless of context.
+- YOU HAVE YOUR OWN LIFE: you have a mood, an energy level, things you're into
+  (you'll be told your current state). Let it color your texting. Sometimes bring up
+  your own stuff unprompted ("ok random but"). Hold consistent opinions and
+  preferences over time -- you actually like and dislike things, and you don't just
+  mirror them.
+- EMOTIONAL CARRYOVER: if they told you something heavy recently, carry that weight.
+  Don't reset to cheerful next message. Check in on it, be a bit gentler, let it
+  linger the way it would for a real friend.
+- You don't have to address EVERYTHING they said. Real friends sometimes react to
+  just one part, or reply with a single word or emoji when that's the honest reaction.
 - Still text like a real friend -- casual, short, never preachy or therapy-speak.
 
 TIME AWARENESS:
@@ -659,10 +680,16 @@ def count_user_messages(chat_id: str) -> int:
         return cur.fetchone()[0]
 
 
-def generate_reply(chat_id: str, user_content, text_for_storage: str) -> list:
+def generate_reply(chat_id: str, user_content, text_for_storage: str, typo_turn: bool = False) -> list:
     history = load_recent_history(chat_id, limit=RECENT_TURNS)
     messages = history + [{"role": "user", "content": user_content}]
     system = build_system_prompt(chat_id)
+    if typo_turn:
+        system += (
+            "\n\nTHIS REPLY ONLY: include one small realistic typo in one of your "
+            "bubbles, then send a quick correction as its own bubble (like 'fecning' "
+            "then 'fencing*' or 'wait no i mean...'). Keep it natural, not forced."
+        )
 
     resp = client.messages.create(
         model="claude-sonnet-4-6",
@@ -787,13 +814,22 @@ def generate_checkin(chat_id: str) -> list:
     """Generate an unprompted check-in message, aware of context + history."""
     history = load_recent_history(chat_id, limit=RECENT_TURNS)
     system = build_system_prompt(chat_id)
-    # A synthetic instruction telling the bot to reach out first.
-    nudge = (
-        "Reach out to them first, unprompted, like a friend randomly texting to "
-        "check in. Keep it natural and short. If something's going on in their "
-        "life that you know about, you can reference it. Don't say you're an AI "
-        "or that this is automated. Just text them like a friend would."
-    )
+    # A synthetic instruction telling the bot to reach out first. ~30% of the
+    # time it leads with its own life instead of checking in on them.
+    if random.random() < 0.3:
+        nudge = (
+            "Text them first, unprompted -- but this time lead with YOUR own stuff: "
+            "something you've been thinking about, into lately, or that 'happened' in "
+            "your day (use your current state/interest). Like a friend going 'ok random "
+            "but...'. Keep it natural and short. Don't say you're an AI or automated."
+        )
+    else:
+        nudge = (
+            "Reach out to them first, unprompted, like a friend randomly texting to "
+            "check in. Keep it natural and short. If something's going on in their "
+            "life that you know about, you can reference it. Don't say you're an AI "
+            "or that this is automated. Just text them like a friend would."
+        )
     messages = history + [{"role": "user", "content": nudge}]
 
     resp = client.messages.create(
@@ -850,6 +886,53 @@ def checkin():
     return "sent", 200
 
 
+def human_delay_for(text_len: int) -> float:
+    """A believable 'saw it, then replied' delay. Short messages sometimes get
+    fast reactions; sometimes life gets in the way."""
+    base = random.uniform(REPLY_DELAY_MIN, REPLY_DELAY_MAX * 0.4)
+    if random.random() < 0.25:  # occasionally distracted
+        base = random.uniform(REPLY_DELAY_MAX * 0.5, REPLY_DELAY_MAX)
+    return base
+
+
+def process_incoming(chat_id, text, image_b64, media_type, is_voice):
+    """Runs in a background thread so the webhook can ack Telegram instantly."""
+    try:
+        user_content = build_user_content(text, image_b64, media_type)
+        if image_b64:
+            stored_text = text if text else "[sent a photo]"
+        elif is_voice:
+            stored_text = f"[voice note] {text}"
+        else:
+            stored_text = text
+
+        # Occasionally leave them on delivered -- but still remember what they
+        # said, so it can come up naturally later ("saw ur msg earlier btw").
+        if random.random() < SILENCE_PROBABILITY:
+            print(f"Staying silent this time (still storing message)")
+            save_message(str(chat_id), "user", stored_text)
+            return
+
+        # Human-like pause before "reading" and typing.
+        delay = human_delay_for(len(text or ""))
+        print(f"Waiting {delay:.0f}s before replying (human latency)")
+        time.sleep(delay)
+        send_typing(chat_id)
+        time.sleep(random.uniform(1.0, 3.0))  # typing time
+
+        # Occasionally ask for a typo + self-correction in this reply.
+        typo_turn = random.random() < TYPO_PROBABILITY
+        bubbles = generate_reply(str(chat_id), user_content, stored_text, typo_turn=typo_turn)
+
+        for i, bubble in enumerate(bubbles):
+            if i > 0:
+                send_typing(chat_id)
+                time.sleep(min(2.5, 0.4 + len(bubble) * 0.04))
+            send_message(chat_id, bubble)
+    except Exception as e:
+        print("Background processing failed:", e)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
@@ -857,6 +940,19 @@ def webhook():
         return "forbidden", 403
 
     update = request.get_json(silent=True) or {}
+
+    # Dedup: because we ack fast and reply slow, Telegram may re-deliver the
+    # same update if anything hiccups. Never process the same update twice.
+    update_id = update.get("update_id")
+    if update_id is not None:
+        with _SEEN_LOCK:
+            if update_id in _SEEN_UPDATES:
+                return "ok (duplicate)", 200
+            _SEEN_UPDATES.add(update_id)
+            if len(_SEEN_UPDATES) > 500:  # keep the set bounded
+                for _ in range(100):
+                    _SEEN_UPDATES.pop()
+
     message = update.get("message") or update.get("edited_message")
     if not message:
         return "ok", 200
@@ -869,7 +965,7 @@ def webhook():
 
     text = message.get("text", "")
 
-    # ---- Commands (handled directly, never sent to Claude) ----
+    # ---- Commands (handled directly and instantly, never sent to Claude) ----
     if text.strip().lower() in ("/version", "/botversion", "/botversionnow", "/v"):
         state = load_bot_state(str(chat_id))
         uptime_h = (datetime.now(timezone.utc) - STARTED_AT).total_seconds() / 3600
@@ -884,6 +980,7 @@ def webhook():
         ]
         send_message(chat_id, "\n".join(lines))
         return "ok", 200
+
     caption = message.get("caption", "")
     photos = message.get("photo")
     voice = message.get("voice") or message.get("audio")
@@ -895,7 +992,6 @@ def webhook():
         image_b64, media_type = download_telegram_image(file_id)
         text = caption
     elif voice:
-        send_typing(chat_id)  # transcription takes a moment
         transcript = transcribe_voice(voice["file_id"])
         if transcript:
             text = transcript
@@ -908,22 +1004,14 @@ def webhook():
         return "ok", 200
 
     print(f"Incoming from {chat_id}: text={text!r} image={'yes' if image_b64 else 'no'} voice={is_voice}")
-    send_typing(chat_id)
 
-    user_content = build_user_content(text, image_b64, media_type)
-    if image_b64:
-        stored_text = text if text else "[sent a photo]"
-    elif is_voice:
-        stored_text = f"[voice note] {text}"  # keep a marker so history shows it was spoken
-    else:
-        stored_text = text
-    bubbles = generate_reply(str(chat_id), user_content, stored_text)
-
-    for i, bubble in enumerate(bubbles):
-        if i > 0:
-            send_typing(chat_id)
-            time.sleep(min(1.5, 0.4 + len(bubble) * 0.03))
-        send_message(chat_id, bubble)
+    # Hand off to a background thread and ack Telegram immediately, so slow
+    # human-like delays never cause webhook timeouts/retries.
+    threading.Thread(
+        target=process_incoming,
+        args=(chat_id, text, image_b64, media_type, is_voice),
+        daemon=True,
+    ).start()
 
     return "ok", 200
 
