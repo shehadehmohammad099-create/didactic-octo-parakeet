@@ -54,6 +54,17 @@ REPLY_DELAY_MIN = float(os.environ.get("REPLY_DELAY_MIN", "2"))    # seconds
 REPLY_DELAY_MAX = float(os.environ.get("REPLY_DELAY_MAX", "45"))   # seconds
 TYPO_PROBABILITY = float(os.environ.get("TYPO_PROBABILITY", "0.12"))     # chance a reply includes a typo+fix
 SILENCE_PROBABILITY = float(os.environ.get("SILENCE_PROBABILITY", "0.04"))  # chance it leaves you on delivered
+BATCH_WAIT = float(os.environ.get("BATCH_WAIT", "8"))  # seconds to wait for more messages before replying
+
+# Message batching: rapid-fire messages pool here and get answered as one.
+_PENDING = {}  # chat_id -> {"buffer": [texts], "seq": int}
+_PENDING_LOCK = threading.Lock()
+BATCH_WINDOW = float(os.environ.get("BATCH_WINDOW", "10"))  # seconds to wait for follow-up messages before replying
+
+# Buffer for message batching: when you send several messages in a burst, they
+# accumulate here and get processed as ONE message once you stop typing.
+_PENDING = {}          # chat_id -> {"texts": [...], "image": (b64, media_type) or None, "timer": Timer}
+_PENDING_LOCK = threading.Lock()
 
 # Dedup Telegram update retries (needed because we ack instantly and reply slowly)
 _SEEN_UPDATES = set()
@@ -252,6 +263,36 @@ def init_db():
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_episodes_chat ON episodes (chat_id, significance)")
+
+        # Upcoming plans/events extracted from conversation, for proactive check-ins.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plans (
+                id          SERIAL PRIMARY KEY,
+                chat_id     TEXT NOT NULL,
+                description TEXT NOT NULL,
+                due_date    DATE,
+                mentioned   BOOLEAN DEFAULT FALSE,
+                ts          TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_plans_chat ON plans (chat_id, due_date)")
+
+        # People in their life, so the bot can ask about them by name.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS people (
+                id       SERIAL PRIMARY KEY,
+                chat_id  TEXT NOT NULL,
+                name     TEXT NOT NULL,
+                relation TEXT DEFAULT '',
+                notes    TEXT DEFAULT '',
+                updated  TIMESTAMPTZ DEFAULT now(),
+                UNIQUE (chat_id, name)
+            )
+            """
+        )
         conn.commit()
     print("DB ready.")
 
@@ -435,6 +476,116 @@ def add_episodes(chat_id: str, episodes: list):
         conn.commit()
 
 
+# ---- Plans (proactive memory of upcoming events) ----
+def add_plans(chat_id: str, plans: list):
+    if not DATABASE_URL or not plans:
+        return
+    with db_conn() as conn, conn.cursor() as cur:
+        for p in plans:
+            desc = p.get("description", "").strip()
+            date_str = p.get("date")  # expected YYYY-MM-DD or null
+            if not desc:
+                continue
+            # avoid duplicate plans with same description still pending
+            cur.execute(
+                "SELECT 1 FROM plans WHERE chat_id = %s AND description = %s AND mentioned = FALSE",
+                (chat_id, desc),
+            )
+            if cur.fetchone():
+                continue
+            cur.execute(
+                "INSERT INTO plans (chat_id, description, due_date) VALUES (%s, %s, %s)",
+                (chat_id, desc, date_str),
+            )
+        conn.commit()
+
+
+def get_due_plans(chat_id: str) -> list:
+    """Plans due today (or overdue) that haven't been proactively mentioned yet."""
+    if not DATABASE_URL:
+        return []
+    today = datetime.now(LOCAL_TZ).date()
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, description, due_date FROM plans
+            WHERE chat_id = %s AND mentioned = FALSE AND due_date IS NOT NULL AND due_date <= %s
+            ORDER BY due_date
+            """,
+            (chat_id, today),
+        )
+        return cur.fetchall()
+
+
+def mark_plan_mentioned(plan_id: int):
+    if not DATABASE_URL:
+        return
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE plans SET mentioned = TRUE WHERE id = %s", (plan_id,))
+        conn.commit()
+
+
+def load_upcoming_plans(chat_id: str, limit: int = 5) -> list:
+    if not DATABASE_URL:
+        return []
+    today = datetime.now(LOCAL_TZ).date()
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT description, due_date FROM plans
+            WHERE chat_id = %s AND (due_date IS NULL OR due_date >= %s) AND mentioned = FALSE
+            ORDER BY due_date NULLS LAST LIMIT %s
+            """,
+            (chat_id, today, limit),
+        )
+        rows = cur.fetchall()
+    out = []
+    for desc, due in rows:
+        out.append(f"{desc} ({due.strftime('%a %d %b')})" if due else desc)
+    return out
+
+
+# ---- People in their life ----
+def upsert_people(chat_id: str, people: list):
+    if not DATABASE_URL or not people:
+        return
+    with db_conn() as conn, conn.cursor() as cur:
+        for p in people:
+            name = p.get("name", "").strip()
+            if not name:
+                continue
+            cur.execute(
+                """
+                INSERT INTO people (chat_id, name, relation, notes, updated)
+                VALUES (%s, %s, %s, %s, now())
+                ON CONFLICT (chat_id, name) DO UPDATE
+                  SET relation = CASE WHEN EXCLUDED.relation <> '' THEN EXCLUDED.relation ELSE people.relation END,
+                      notes = CASE WHEN EXCLUDED.notes <> '' THEN EXCLUDED.notes ELSE people.notes END,
+                      updated = now()
+                """,
+                (chat_id, name, p.get("relation", ""), p.get("notes", "")),
+            )
+        conn.commit()
+
+
+def load_people(chat_id: str, limit: int = 10) -> list:
+    if not DATABASE_URL:
+        return []
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT name, relation, notes FROM people WHERE chat_id = %s ORDER BY updated DESC LIMIT %s",
+            (chat_id, limit),
+        )
+        rows = cur.fetchall()
+    out = []
+    for name, relation, notes in rows:
+        line = name + (f" ({relation})" if relation else "")
+        if notes:
+            line += f" -- {notes}"
+        out.append(line)
+    return out
+
+
 # ---- Reflection engine ----
 def get_reflection_marker(chat_id: str) -> int:
     if not DATABASE_URL:
@@ -498,10 +649,17 @@ def reflect(chat_id: str):
             '  "interest": "a thing you\'re personally into at the moment (a show, an idea, a hobby '
             '-- invent/evolve this naturally, it\'s YOUR life)",\n'
             '  "episodes": [ {"title": "...", "memory": "1-2 sentence memory of a meaningful moment '
-            'or arc from these conversations", "significance": 1-10} ]\n'
+            'or arc from these conversations", "significance": 1-10} ],\n'
+            '  "plans": [ {"description": "an upcoming event/plan they mentioned (exam, trip, match, '
+            'appointment)", "date": "YYYY-MM-DD or null if unknown"} ],\n'
+            '  "people": [ {"name": "person they mentioned", "relation": "friend/mum/teacher/etc if '
+            'clear", "notes": "current situation with them, brief"} ]\n'
             "}\n"
             "episodes should usually be empty [] -- only add one for genuinely meaningful moments "
-            "(big news, emotional conversations, decisions, memorable jokes), not routine chat."
+            "(big news, emotional conversations, decisions, memorable jokes), not routine chat. "
+            "plans: only real, dated-ish future events (resolve relative dates like 'thursday' to an "
+            "actual date using the current time given above). people: only actual named people in "
+            "their life, not celebrities."
         )
 
         resp = client.messages.create(
@@ -524,6 +682,8 @@ def reflect(chat_id: str):
             data.get("interest", state["interest"]),
         )
         add_episodes(chat_id, data.get("episodes", []))
+        add_plans(chat_id, data.get("plans", []))
+        upsert_people(chat_id, data.get("people", []))
 
         set_reflection_marker(chat_id, max(m[0] for m in new_msgs))
         print(f"Reflected for {chat_id}: mood={data.get('mood')}, "
@@ -644,6 +804,18 @@ def build_system_prompt(chat_id: str) -> str:
     facts = load_facts(chat_id)
     if facts:
         parts.append("\nLONG-TERM things you know about them:\n" + "\n".join(f"- {f}" for f in facts))
+    people = load_people(chat_id)
+    if people:
+        parts.append(
+            "\nPEOPLE in their life (ask about them BY NAME when it fits -- 'hows things with X'):\n"
+            + "\n".join(f"- {p}" for p in people)
+        )
+    plans = load_upcoming_plans(chat_id)
+    if plans:
+        parts.append(
+            "\nTHEIR UPCOMING PLANS (be aware of these -- wish luck before, ask how it went after):\n"
+            + "\n".join(f"- {p}" for p in plans)
+        )
     episodes = load_top_episodes(chat_id, limit=5)
     if episodes:
         parts.append(
@@ -861,16 +1033,52 @@ def checkin():
     # a message gets sent. This is what makes follow-ups feel self-motivated.
     reflect(ALLOWED_CHAT_ID)
 
+    force = request.args.get("force") == "1"
+
+    # PLAN-DUE check-ins take priority and skip the dice: if something they
+    # mentioned is happening today, the bot reaches out about it specifically.
+    due = get_due_plans(ALLOWED_CHAT_ID)
+    if due:
+        plan_id, description, due_date = due[0]
+        print(f"Plan due today: {description!r} -- sending targeted check-in")
+        send_typing(ALLOWED_CHAT_ID)
+        history = load_recent_history(ALLOWED_CHAT_ID, limit=RECENT_TURNS)
+        system = build_system_prompt(ALLOWED_CHAT_ID)
+        nudge = (
+            f"You remember that TODAY they have this: \"{description}\". Text them "
+            "first about it specifically -- wish them luck, ask if they're ready, or "
+            "ask how it went if it's likely already over given the current time. "
+            "Natural and short, like a friend who remembered. Don't say you're an AI."
+        )
+        resp2 = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=150,
+            system=system,
+            messages=history + [{"role": "user", "content": nudge}],
+        )
+        reply = "".join(b.text for b in resp2.content if b.type == "text").strip().strip('"')
+        save_message(ALLOWED_CHAT_ID, "assistant", reply)
+        for i, bubble in enumerate([b.strip() for b in reply.split("|||") if b.strip()]):
+            if i > 0:
+                send_typing(ALLOWED_CHAT_ID)
+                time.sleep(min(1.5, 0.4 + len(bubble) * 0.03))
+            send_message(ALLOWED_CHAT_ID, bubble)
+        mark_plan_mentioned(plan_id)
+        set_last_checkin(ALLOWED_CHAT_ID, datetime.now(timezone.utc))
+        return "sent (plan due)", 200
+
     # Roll the dice: only send sometimes, so timing feels random.
-    if random.random() > CHECKIN_PROBABILITY:
+    if not force and random.random() > CHECKIN_PROBABILITY:
+        print("Check-in skipped: dice roll")
         return "reflected, skipped send (dice)", 200
 
     # Enforce a minimum gap since the last check-in.
     last = get_last_checkin(ALLOWED_CHAT_ID)
     now = datetime.now(timezone.utc)
-    if last:
+    if last and not force:
         hours_since = (now - last).total_seconds() / 3600
         if hours_since < CHECKIN_MIN_GAP_HOURS:
+            print(f"Check-in skipped: only {hours_since:.1f}h since last")
             return f"skipped (only {hours_since:.1f}h since last)", 200
 
     print("Sending proactive check-in")
@@ -895,32 +1103,40 @@ def human_delay_for(text_len: int) -> float:
     return base
 
 
-def process_incoming(chat_id, text, image_b64, media_type, is_voice):
-    """Runs in a background thread so the webhook can ack Telegram instantly."""
+def process_batch(chat_id, seq: int, image_b64=None, media_type=None):
+    """Debounced batch processor: waits BATCH_WAIT; if newer messages arrived,
+    bails (their thread will handle the whole buffer). Otherwise replies to the
+    pooled burst of messages as ONE thought."""
     try:
-        user_content = build_user_content(text, image_b64, media_type)
-        if image_b64:
-            stored_text = text if text else "[sent a photo]"
-        elif is_voice:
-            stored_text = f"[voice note] {text}"
-        else:
-            stored_text = text
+        time.sleep(BATCH_WAIT)
+        with _PENDING_LOCK:
+            pending = _PENDING.get(str(chat_id))
+            if not pending or pending["seq"] != seq:
+                return  # newer message arrived; that thread owns the batch now
+            texts = pending["buffer"][:]
+            _PENDING.pop(str(chat_id), None)
 
-        # Occasionally leave them on delivered -- but still remember what they
-        # said, so it can come up naturally later ("saw ur msg earlier btw").
-        if random.random() < SILENCE_PROBABILITY:
-            print(f"Staying silent this time (still storing message)")
-            save_message(str(chat_id), "user", stored_text)
+        combined = "\n".join(t for t in texts if t).strip()
+        if not combined and not image_b64:
             return
 
-        # Human-like pause before "reading" and typing.
-        delay = human_delay_for(len(text or ""))
-        print(f"Waiting {delay:.0f}s before replying (human latency)")
-        time.sleep(delay)
-        send_typing(chat_id)
-        time.sleep(random.uniform(1.0, 3.0))  # typing time
+        # Occasionally leave them on delivered -- but still remember.
+        if random.random() < SILENCE_PROBABILITY:
+            print("Staying silent this time (still storing message)")
+            save_message(str(chat_id), "user", combined or "[sent a photo]")
+            return
 
-        # Occasionally ask for a typo + self-correction in this reply.
+        # Human-like pause (batch wait already added some).
+        delay = max(0, human_delay_for(len(combined)) - BATCH_WAIT)
+        if delay > 0:
+            print(f"Waiting {delay:.0f}s more before replying (human latency)")
+            time.sleep(delay)
+        send_typing(chat_id)
+        time.sleep(random.uniform(1.0, 3.0))
+
+        user_content = build_user_content(combined, image_b64, media_type)
+        stored_text = combined if combined else "[sent a photo]"
+
         typo_turn = random.random() < TYPO_PROBABILITY
         bubbles = generate_reply(str(chat_id), user_content, stored_text, typo_turn=typo_turn)
 
@@ -930,7 +1146,23 @@ def process_incoming(chat_id, text, image_b64, media_type, is_voice):
                 time.sleep(min(2.5, 0.4 + len(bubble) * 0.04))
             send_message(chat_id, bubble)
     except Exception as e:
-        print("Background processing failed:", e)
+        print("Batch processing failed:", e)
+
+
+def queue_message(chat_id, text: str, image_b64=None, media_type=None):
+    """Add a message to the chat's pending buffer and (re)start the debounce."""
+    key = str(chat_id)
+    with _PENDING_LOCK:
+        entry = _PENDING.setdefault(key, {"buffer": [], "seq": 0})
+        if text:
+            entry["buffer"].append(text)
+        entry["seq"] += 1
+        seq = entry["seq"]
+    threading.Thread(
+        target=process_batch,
+        args=(chat_id, seq, image_b64, media_type),
+        daemon=True,
+    ).start()
 
 
 @app.route("/webhook", methods=["POST"])
@@ -1005,13 +1237,10 @@ def webhook():
 
     print(f"Incoming from {chat_id}: text={text!r} image={'yes' if image_b64 else 'no'} voice={is_voice}")
 
-    # Hand off to a background thread and ack Telegram immediately, so slow
-    # human-like delays never cause webhook timeouts/retries.
-    threading.Thread(
-        target=process_incoming,
-        args=(chat_id, text, image_b64, media_type, is_voice),
-        daemon=True,
-    ).start()
+    # Queue into the debounce buffer: rapid multi-message bursts get pooled and
+    # answered as ONE thought once you stop typing. Ack Telegram immediately.
+    queued_text = f"[voice note] {text}" if is_voice else text
+    queue_message(chat_id, queued_text, image_b64, media_type)
 
     return "ok", 200
 
