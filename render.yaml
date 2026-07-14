@@ -40,3 +40,5 @@ services:
         sync: false
       - key: SILENCE_PROBABILITY
         sync: false
+      - key: BATCH_WAIT
+        sync: false
