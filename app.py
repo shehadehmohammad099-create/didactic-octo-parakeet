@@ -1019,6 +1019,76 @@ def generate_checkin(chat_id: str) -> list:
     return bubbles or [reply]
 
 
+def run_checkin_work(force: bool):
+    """All the check-in work, run in a background thread so the endpoint can
+    respond to the cron pinger instantly (avoids timeouts / retries)."""
+    try:
+        # Reflect first: the bot's inner life runs on every ping, whether or not
+        # a message gets sent. This is what makes follow-ups feel self-motivated.
+        reflect(ALLOWED_CHAT_ID)
+
+        # PLAN-DUE check-ins take priority and skip the dice: if something they
+        # mentioned is happening today, the bot reaches out about it specifically.
+        due = get_due_plans(ALLOWED_CHAT_ID)
+        if due:
+            plan_id, description, due_date = due[0]
+            print(f"Plan due today: {description!r} -- sending targeted check-in")
+            send_typing(ALLOWED_CHAT_ID)
+            history = load_recent_history(ALLOWED_CHAT_ID, limit=RECENT_TURNS)
+            system = build_system_prompt(ALLOWED_CHAT_ID)
+            nudge = (
+                f"You remember that TODAY they have this: \"{description}\". Text them "
+                "first about it specifically -- wish them luck, ask if they're ready, or "
+                "ask how it went if it's likely already over given the current time. "
+                "Natural and short, like a friend who remembered. Don't say you're an AI."
+            )
+            resp2 = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=150,
+                system=system,
+                messages=history + [{"role": "user", "content": nudge}],
+            )
+            reply = "".join(b.text for b in resp2.content if b.type == "text").strip().strip('"')
+            save_message(ALLOWED_CHAT_ID, "assistant", reply)
+            for i, bubble in enumerate([b.strip() for b in reply.split("|||") if b.strip()]):
+                if i > 0:
+                    send_typing(ALLOWED_CHAT_ID)
+                    time.sleep(min(1.5, 0.4 + len(bubble) * 0.03))
+                send_message(ALLOWED_CHAT_ID, bubble)
+            mark_plan_mentioned(plan_id)
+            set_last_checkin(ALLOWED_CHAT_ID, datetime.now(timezone.utc))
+            print("Check-in result: sent (plan due)")
+            return
+
+        # Roll the dice: only send sometimes, so timing feels random.
+        if not force and random.random() > CHECKIN_PROBABILITY:
+            print("Check-in skipped: dice roll")
+            return
+
+        # Enforce a minimum gap since the last check-in.
+        last = get_last_checkin(ALLOWED_CHAT_ID)
+        now = datetime.now(timezone.utc)
+        if last and not force:
+            hours_since = (now - last).total_seconds() / 3600
+            if hours_since < CHECKIN_MIN_GAP_HOURS:
+                print(f"Check-in skipped: only {hours_since:.1f}h since last")
+                return
+
+        print("Sending proactive check-in")
+        send_typing(ALLOWED_CHAT_ID)
+        bubbles = generate_checkin(ALLOWED_CHAT_ID)
+        for i, bubble in enumerate(bubbles):
+            if i > 0:
+                send_typing(ALLOWED_CHAT_ID)
+                time.sleep(min(1.5, 0.4 + len(bubble) * 0.03))
+            send_message(ALLOWED_CHAT_ID, bubble)
+
+        set_last_checkin(ALLOWED_CHAT_ID, now)
+        print("Check-in result: sent")
+    except Exception as e:
+        print("Check-in work failed:", e)
+
+
 @app.route("/checkin", methods=["GET", "POST"])
 def checkin():
     # Protect the endpoint so randoms can't trigger messages to you.
@@ -1029,69 +1099,12 @@ def checkin():
     if not ALLOWED_CHAT_ID:
         return "no ALLOWED_CHAT_ID set", 400
 
-    # Reflect first: the bot's inner life runs on every ping, whether or not
-    # a message gets sent. This is what makes follow-ups feel self-motivated.
-    reflect(ALLOWED_CHAT_ID)
-
     force = request.args.get("force") == "1"
 
-    # PLAN-DUE check-ins take priority and skip the dice: if something they
-    # mentioned is happening today, the bot reaches out about it specifically.
-    due = get_due_plans(ALLOWED_CHAT_ID)
-    if due:
-        plan_id, description, due_date = due[0]
-        print(f"Plan due today: {description!r} -- sending targeted check-in")
-        send_typing(ALLOWED_CHAT_ID)
-        history = load_recent_history(ALLOWED_CHAT_ID, limit=RECENT_TURNS)
-        system = build_system_prompt(ALLOWED_CHAT_ID)
-        nudge = (
-            f"You remember that TODAY they have this: \"{description}\". Text them "
-            "first about it specifically -- wish them luck, ask if they're ready, or "
-            "ask how it went if it's likely already over given the current time. "
-            "Natural and short, like a friend who remembered. Don't say you're an AI."
-        )
-        resp2 = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=150,
-            system=system,
-            messages=history + [{"role": "user", "content": nudge}],
-        )
-        reply = "".join(b.text for b in resp2.content if b.type == "text").strip().strip('"')
-        save_message(ALLOWED_CHAT_ID, "assistant", reply)
-        for i, bubble in enumerate([b.strip() for b in reply.split("|||") if b.strip()]):
-            if i > 0:
-                send_typing(ALLOWED_CHAT_ID)
-                time.sleep(min(1.5, 0.4 + len(bubble) * 0.03))
-            send_message(ALLOWED_CHAT_ID, bubble)
-        mark_plan_mentioned(plan_id)
-        set_last_checkin(ALLOWED_CHAT_ID, datetime.now(timezone.utc))
-        return "sent (plan due)", 200
-
-    # Roll the dice: only send sometimes, so timing feels random.
-    if not force and random.random() > CHECKIN_PROBABILITY:
-        print("Check-in skipped: dice roll")
-        return "reflected, skipped send (dice)", 200
-
-    # Enforce a minimum gap since the last check-in.
-    last = get_last_checkin(ALLOWED_CHAT_ID)
-    now = datetime.now(timezone.utc)
-    if last and not force:
-        hours_since = (now - last).total_seconds() / 3600
-        if hours_since < CHECKIN_MIN_GAP_HOURS:
-            print(f"Check-in skipped: only {hours_since:.1f}h since last")
-            return f"skipped (only {hours_since:.1f}h since last)", 200
-
-    print("Sending proactive check-in")
-    send_typing(ALLOWED_CHAT_ID)
-    bubbles = generate_checkin(ALLOWED_CHAT_ID)
-    for i, bubble in enumerate(bubbles):
-        if i > 0:
-            send_typing(ALLOWED_CHAT_ID)
-            time.sleep(min(1.5, 0.4 + len(bubble) * 0.03))
-        send_message(ALLOWED_CHAT_ID, bubble)
-
-    set_last_checkin(ALLOWED_CHAT_ID, now)
-    return "sent", 200
+    # Respond to the pinger IMMEDIATELY with a tiny body; do everything in a
+    # background thread. Outcomes are visible in Render logs.
+    threading.Thread(target=run_checkin_work, args=(force,), daemon=True).start()
+    return "ok", 200
 
 
 def human_delay_for(text_len: int) -> float:
